@@ -17,6 +17,13 @@ Once `PEAK_SCAN` locks onto the perfect frame, [get_blade_centerline_analysis] t
 2. **Finding the Extents (Dot Product Projection):** We draw an imaginary vector line (`vx, vy`) straight through the middle of the blade. We then use **Dot Product Scalar Projection** to smash every single white pixel onto that imaginary line. The pixel that lands furthest back is the **Root (P1)**. The pixel that lands furthest forward is the **Tip (P3)**.
 3. **Centerline Trace (Rotational Scanning & Noise Rejection):** The computer rotates the image entirely so the blade is perfectly flat on the screen. It then scans through the blade from left-to-right, looking at one vertical column of pixels at a time.
 
-4.
+- _Note:_ The code also deliberately ignores the first 15% of the blade nearest to the hub, because the hub block is thick and asymmetrical, which would falsely distort the centerline trace.
+
+4. **Calculus-Inspired Smoothing:** The raw centerline is jagged due to pixelation. A discrete convolution (`np.convolve`) is run over the points. This is effectively a running average that mathematical smoothens the jagged pixels into a fluid, accurate curve.
+5. **The Deflection Math:**
+   We measure bending exclusively between the Midpoint (P2) and the Tip (P3).
+   - First, we calculate exactly where the midpoint is by checking which point lies physically halfway along the vector projection span.
+   - Then, we create a mathematical Straight Line connecting **P2** and **P3**.
+   - The single point with the largest distance is flagged as the **Max Deflection**. If this distance exceeds `DEFLECTION_THRESHOLD` (10 pixels), the system alerts that the blade is bending dangerously.
 
 ## 3. Code Explanation:

@@ -9,8 +9,8 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================
 
-VIDEO_SOURCE   = 'TopDown/TopDown/clockwise_8rpm.mp4'
-CSV_FILE       = 'cc_8rpm_analyzed_data.csv'
+VIDEO_SOURCE   = 'TopDown/TopDown/clockwise_30rpm.mp4'
+CSV_FILE       = 'clockwise_30rpm_analyzed_data.csv'
 EVIDENCE_FOLDER = 'csv_evidence'
 
 # Deflection pixel threshold (we set as 10 pixel threashold if the blade bend more than 10 pixel it will show red)
@@ -33,21 +33,16 @@ BG_INIT_FRAMES = 60 # spend the first 60 frames of the video just leaning what t
 
 
 
-# ============================================================
-# IMAGE ANALYSIS FUNCTIONS  (this is a mini-factory that extract the blade from the video pure black and white so called mask)
-# ============================================================
-
-def get_blade_mask(frame, back_sub, learning_rate=0):
-    # Pre-filter frame to reduce high-frequency noise and environmental artifacts
-    blurred_frame = cv2.GaussianBlur(frame, (5, 5), 0)
+def get_blade_mask(frame, median_bg):
+    # Absolute difference between current frame and empty background
+    diff = cv2.absdiff(frame, median_bg)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    fg_mask = back_sub.apply(blurred_frame, learningRate=learning_rate)
+    # Any pixel that differs by more than 30 intensity is considered moving (the blade)
+    # This prevents the mask from breaking up in shaded parts of the blade!
+    _, fg_mask = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
     
-    # MOG2 labels shadows as 127 and moving objects as 255.
-    # By using threshold 254, we completely eliminate the shadows from the mask.
-    _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
-    
-    # Clean up the mask
+    # Slight blur to soften edges
     fg_mask = cv2.medianBlur(fg_mask, 5)
     
     # Slightly larger noise kernel to aggressively remove small specks (clouds/birds)
@@ -84,30 +79,28 @@ def find_largest_contour(mask, min_area=500):
 # here is the heavy maths where we are doing all the operations, it take solid 
 # white blade shape find its exact center line and then measure the deflection
 #================
-"""
-    Core analysis function,  extracts the actual blade centerline curve and
+
+def get_blade_centerline_analysis(contour, mask):
+    """
+    Core analysis function — extracts the actual blade centerline curve and
     measures how much the TIP bends away from the ROOT's straight alignment.
 
     Steps:
       1. Find the blade axis via fitLine; project every contour point onto it
          to get the exact physical root (P1, min-projection) and tip (P3, max).
       2. Rotate the mask so the blade lies horizontally, scan each column for
-         the vertical centre -> raw centerline in rotated space.  Points are
-         already ordered root -> tip because we scan columns left-to-right.
+         the vertical centre → raw centerline in rotated space.  Points are
+         already ordered root→tip because we scan columns left-to-right.
       3. Smooth the raw centerline, back-transform to original image space,
          then re-sort points by their projection onto the blade axis so the
-         blue polyline always flows root -> tip without zigzagging.
+         blue polyline always flows root→tip without zigzagging.
       4. Stitch the exact P1 and P3 contour extremes to the two ends.
       5. Find P2 = the sample point closest to the physical arc-length midpoint
          of the blade (halfway between P1 and P3 along the blade axis).
-      6. Fit a straight reference line ONLY on the root half (P1 -> P2 points),
-         then measure the perpendicular deviation of the tip half (P2 -> P3) from
-         that line -> maximum deviation = deflection in pixels.
+      6. Fit a straight reference line ONLY on the root half (P1→P2 points),
+         then measure the perpendicular deviation of the tip half (P2→P3) from
+         that line → maximum deviation = deflection in pixels.
     """
-
-
-def get_blade_centerline_analysis(contour, mask):
-    
     # ---- 1. Exact Physical Tip and Root via fitLine Projection ----
     lv = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
     vx, vy, x0, y0 = float(lv[0]), float(lv[1]), float(lv[2]), float(lv[3])
@@ -404,9 +397,18 @@ def main():
     delay_ms     = max(1, int(1000 / fps))
     print(f"Video: {total_frames} frames @ {fps:.1f} fps  (delay {delay_ms} ms/frame)\n")
 
-    # ---- Initialise background subtractor ----
-    back_sub = cv2.createBackgroundSubtractorMOG2(
-        history=1000, varThreshold=30, detectShadows=True)
+    # ---- Compute Perfect Empty Background ----
+    # Taking the median of 50 samples across the video perfectly erases the moving blades.
+    print("Computing Median Background (takes a few seconds)...")
+    frame_indices = np.linspace(0, total_frames - 1, 50, dtype=int)
+    frames_for_bg = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret: frames_for_bg.append(frame)
+    median_bg = np.median(frames_for_bg, axis=0).astype(np.uint8)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # reset to start
+    print("Median Background ready.\n")
 
     # ---- State machine — one per blade ----
     BLADE_KEYS = ['blade1', 'blade2', 'blade3']
@@ -443,8 +445,7 @@ def main():
             frame_count += 1
 
             # ---- Background subtractor ----
-            lr = -1 if frame_count <= BG_INIT_FRAMES else 0
-            mask = get_blade_mask(frame, back_sub, learning_rate=lr)
+            mask = get_blade_mask(frame, median_bg)
 
             # ---- Look up CSV angles for this frame ----
             csv_row = frame_map.get(frame_count, None)
@@ -551,27 +552,22 @@ def main():
             display = frame.copy()
 
             # Green mask overlay on live feed
-            if lr == -1:
-                state_text = f"INIT BG ({frame_count}/{BG_INIT_FRAMES})"
-                cv2.putText(display, state_text, (30, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-            else:
-                overlay = display.copy(); overlay[mask > 0] = (0, 255, 0)
-                display = cv2.addWeighted(overlay, 0.25, display, 0.75, 0)
+            overlay = display.copy(); overlay[mask > 0] = (0, 255, 0)
+            display = cv2.addWeighted(overlay, 0.25, display, 0.75, 0)
 
-                # Per-blade state labels
-                for b, key in enumerate(BLADE_KEYS):
-                    s_name = ["IDLE", "PEAK_SCAN", "COOLDOWN"][states[b]['state']]
-                    if csv_row:
-                        ang = math.degrees(normalise_angle(csv_row[key]))
-                        txt = f"B{b+1}: {s_name}  ({ang:.1f}°)"
-                    else:
-                        txt = f"B{b+1}: {s_name}  (no CSV)"
-                    cv2.putText(display, txt, (30, 50 + b * 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # Per-blade state labels
+            for b, key in enumerate(BLADE_KEYS):
+                s_name = ["IDLE", "PEAK_SCAN", "COOLDOWN"][states[b]['state']]
+                if csv_row:
+                    ang = math.degrees(normalise_angle(csv_row[key]))
+                    txt = f"B{b+1}: {s_name}  ({ang:.1f}°)"
+                else:
+                    txt = f"B{b+1}: {s_name}  (no CSV)"
+                cv2.putText(display, txt, (30, 50 + b * 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                cv2.putText(display, f"Frame: {frame_count}", (30, display.shape[0] - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.putText(display, f"Frame: {frame_count}", (30, display.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
             # ---- Show result overlays (show each blade's result for N frames) ----
             for b in range(NUM_BLADES):
